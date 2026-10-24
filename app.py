@@ -32,6 +32,9 @@ def initialize():
             id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id),
             before_stock INTEGER NOT NULL, after_stock INTEGER NOT NULL,
             reason TEXT NOT NULL, created_at TEXT NOT NULL)''')
+        product_columns = {r['name'] for r in c.execute('PRAGMA table_info(products)')}
+        if 'archived' not in product_columns:
+            c.execute('ALTER TABLE products ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
         columns = {r['name'] for r in c.execute('PRAGMA table_info(movements)')}
         if 'confirmed' not in columns:
             c.execute('ALTER TABLE movements ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1')
@@ -104,10 +107,11 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        product_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/(edit|delete|restore)', self.path)
         confirm_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/confirm', self.path)
         stock_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/stock', self.path)
         edit_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/edit', self.path)
-        if self.path not in ('/api/products', '/api/movements') and not edit_match and not stock_match and not confirm_match:
+        if self.path not in ('/api/products', '/api/movements') and not edit_match and not stock_match and not confirm_match and not product_match:
             return self.reply({'error': '接口不存在'}, 404)
         try:
             length = int(self.headers.get('Content-Length', '0'))
@@ -117,13 +121,40 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(d, dict):
                 raise ValueError('请求格式不正确')
             with connect() as c:
-                if confirm_match:
+                if product_match:
+                    pid, action = int(product_match[1]), product_match[2]
+                    c.execute('BEGIN IMMEDIATE')
+                    product = c.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone()
+                    if not product:
+                        return self.reply({'error':'商品不存在或已删除'},404)
+                    if action == 'edit':
+                        if product['archived']:
+                            raise ValueError('请先恢复已归档商品，再编辑资料')
+                        c.execute('''UPDATE products SET sku=?,name=?,category=?,unit=?,cost=?,price=?,minimum=?
+                            WHERE id=?''',(required(d,'sku','商品编码'),required(d,'name','商品名称'),
+                            required(d,'category','分类'),required(d,'unit','单位'),money(d.get('cost')),
+                            money(d.get('price')),integer(d.get('minimum'),'预警库存'),pid))
+                    elif action == 'restore':
+                        c.execute('UPDATE products SET archived=0 WHERE id=?',(pid,))
+                    else:
+                        if product['stock'] != 0:
+                            raise ValueError('该商品还有库存，请先处理库存，再删除')
+                        has_history = c.execute('SELECT 1 FROM movements WHERE product_id=? LIMIT 1',(pid,)).fetchone()
+                        has_adjustments = c.execute('SELECT 1 FROM stock_adjustments WHERE product_id=? LIMIT 1',(pid,)).fetchone()
+                        if has_history or has_adjustments:
+                            c.execute('UPDATE products SET archived=1 WHERE id=?',(pid,))
+                        else:
+                            c.execute('DELETE FROM products WHERE id=?',(pid,))
+                elif confirm_match:
                     confirmed_at = business_time(d.get('confirmed_at'))
                     c.execute('BEGIN IMMEDIATE')
                     movement = c.execute('SELECT * FROM movements WHERE id=?',(int(confirm_match[1]),)).fetchone()
                     if not movement or movement['kind'] != 'in':
                         raise ValueError('只能确认采购入库单')
                     if not movement['confirmed']:
+                        product = c.execute('SELECT * FROM products WHERE id=?',(movement['product_id'],)).fetchone()
+                        if product['archived']:
+                            raise ValueError('商品已归档，请先恢复商品再确认入库')
                         c.execute('UPDATE products SET stock=stock+? WHERE id=?',
                                   (movement['quantity'],movement['product_id']))
                         c.execute('UPDATE movements SET confirmed=1,confirmed_at=?,updated_at=? WHERE id=?',
@@ -136,6 +167,8 @@ class Handler(SimpleHTTPRequestHandler):
                     product = c.execute('SELECT * FROM products WHERE id=?',(int(stock_match[1]),)).fetchone()
                     if not product:
                         raise ValueError('商品不存在')
+                    if product['archived']:
+                        raise ValueError('商品已归档，请先恢复商品')
                     if product['stock'] != expected:
                         return self.reply({'error':'库存已被其他操作更新，请刷新后重试'},409)
                     if target == expected:
@@ -180,6 +213,8 @@ class Handler(SimpleHTTPRequestHandler):
                     p = c.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone()
                     if not p:
                         raise ValueError('商品不存在')
+                    if p['archived'] and (not old or old['quantity'] != qty):
+                        raise ValueError('商品已归档，新增业务或调整数量前请先恢复商品')
                     delta = (old['quantity'] - qty) if old else (qty if kind == 'in' else -qty)
                     if kind == 'in' and not confirmed:
                         delta = 0
