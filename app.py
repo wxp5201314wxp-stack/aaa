@@ -33,6 +33,11 @@ def initialize():
             before_stock INTEGER NOT NULL, after_stock INTEGER NOT NULL,
             reason TEXT NOT NULL, created_at TEXT NOT NULL)''')
         columns = {r['name'] for r in c.execute('PRAGMA table_info(movements)')}
+        if 'confirmed' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1')
+        if 'confirmed_at' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN confirmed_at TEXT')
+            c.execute("UPDATE movements SET confirmed_at=created_at WHERE kind='in'")
         if 'freight' not in columns:
             c.execute('ALTER TABLE movements ADD COLUMN freight INTEGER NOT NULL DEFAULT 0')
         if 'unit_price' not in columns:
@@ -99,9 +104,10 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        confirm_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/confirm', self.path)
         stock_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/stock', self.path)
         edit_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/edit', self.path)
-        if self.path not in ('/api/products', '/api/movements') and not edit_match and not stock_match:
+        if self.path not in ('/api/products', '/api/movements') and not edit_match and not stock_match and not confirm_match:
             return self.reply({'error': '接口不存在'}, 404)
         try:
             length = int(self.headers.get('Content-Length', '0'))
@@ -111,7 +117,18 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(d, dict):
                 raise ValueError('请求格式不正确')
             with connect() as c:
-                if stock_match:
+                if confirm_match:
+                    confirmed_at = business_time(d.get('confirmed_at'))
+                    c.execute('BEGIN IMMEDIATE')
+                    movement = c.execute('SELECT * FROM movements WHERE id=?',(int(confirm_match[1]),)).fetchone()
+                    if not movement or movement['kind'] != 'in':
+                        raise ValueError('只能确认采购入库单')
+                    if not movement['confirmed']:
+                        c.execute('UPDATE products SET stock=stock+? WHERE id=?',
+                                  (movement['quantity'],movement['product_id']))
+                        c.execute('UPDATE movements SET confirmed=1,confirmed_at=?,updated_at=? WHERE id=?',
+                                  (confirmed_at,business_time(None),movement['id']))
+                elif stock_match:
                     target = integer(d.get('stock'), '调整后库存')
                     expected = integer(d.get('expected_stock'), '原库存')
                     reason = required(d,'reason','调整原因')
@@ -137,6 +154,9 @@ class Handler(SimpleHTTPRequestHandler):
                     kind = d.get('kind')
                     if kind not in ('in','out'):
                         raise ValueError('业务类型无效')
+                    confirmed = d.get('confirmed', True) if kind == 'in' else True
+                    if not isinstance(confirmed, bool):
+                        raise ValueError('确认入库状态必须为布尔值')
                     raw_price = d.get('unit_price')
                     pending = kind == 'out' and (raw_price is None or str(raw_price).strip() == '')
                     unit_price = None if pending else money(raw_price)
@@ -161,6 +181,8 @@ class Handler(SimpleHTTPRequestHandler):
                     if not p:
                         raise ValueError('商品不存在')
                     delta = (old['quantity'] - qty) if old else (qty if kind == 'in' else -qty)
+                    if kind == 'in' and not confirmed:
+                        delta = 0
                     if p['stock'] + delta < 0:
                         raise ValueError('库存不足，无法保存该数量')
                     c.execute('UPDATE products SET stock=stock+? WHERE id=?',(delta,pid))
@@ -170,8 +192,9 @@ class Handler(SimpleHTTPRequestHandler):
                             (qty,amount,unit_price,int(pending),partner,note,created_at,business_time(None),freight,old['id']))
                     else:
                         c.execute('''INSERT INTO movements(product_id,kind,quantity,amount,partner,note,
-                            created_at,unit_price,price_pending,freight) VALUES(?,?,?,?,?,?,?,?,?,?)''',
-                            (pid,kind,qty,amount,partner,note,created_at,unit_price,int(pending),freight))
+                            created_at,unit_price,price_pending,freight,confirmed,confirmed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                            (pid,kind,qty,amount,partner,note,created_at,unit_price,int(pending),freight,int(confirmed),
+                             created_at if kind == 'in' and confirmed else None))
             return self.reply({'ok':True},201)
         except sqlite3.IntegrityError:
             return self.reply({'error':'商品编码已存在或数据不符合要求'},400)

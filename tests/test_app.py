@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import threading
 import unittest
@@ -16,7 +17,7 @@ class InventoryTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 app.DB = Path(tmp) / 'legacy.db'
                 with sqlite3.connect(app.DB) as c:
-                    c.executescript("CREATE TABLE movements(id INTEGER PRIMARY KEY,product_id INTEGER,kind TEXT,quantity INTEGER,amount INTEGER NOT NULL,partner TEXT,note TEXT,created_at TEXT); INSERT INTO movements VALUES(1,1,'out',3,6000,'客户','','2026-10-20 08:00:00');")
+                    c.executescript("CREATE TABLE movements(id INTEGER PRIMARY KEY,product_id INTEGER,kind TEXT,quantity INTEGER,amount INTEGER NOT NULL,partner TEXT,note TEXT,created_at TEXT); INSERT INTO movements VALUES(1,1,'out',3,6000,'客户','','2026-10-20 08:00:00'); INSERT INTO movements VALUES(2,1,'in',5,5000,'供应商','','2026-10-19 08:00:00');")
                 app.initialize()
                 app.initialize()
                 with app.connect() as c:
@@ -25,6 +26,11 @@ class InventoryTest(unittest.TestCase):
                     self.assertEqual(row['amount'], 6000)
                     self.assertEqual(row['price_pending'], 0)
                     self.assertEqual(row['freight'], 0)
+                    self.assertEqual(row['confirmed'], 1)
+                    self.assertIsNone(row['confirmed_at'])
+                    inbound=c.execute('SELECT * FROM movements WHERE id=2').fetchone()
+                    self.assertEqual(inbound['confirmed'],1)
+                    self.assertEqual(inbound['confirmed_at'],inbound['created_at'])
                     self.assertEqual(row['created_at'], '2026-10-20 08:00:00')
         finally:
             app.DB = old
@@ -126,6 +132,30 @@ class InventoryTest(unittest.TestCase):
                 app.initialize()
                 self.assertEqual(request('/api/state')[1]['products'][0]['stock'],11)
                 self.assertEqual(len(request('/api/state')[1]['adjustments']),1)
+                purchase=dict(product_id=pid,kind='in',quantity=7,unit_price='10',partner='预采购供应商',
+                              confirmed=False,created_at='2026-10-20T09:00')
+                self.assertEqual(request('/api/movements',purchase)[0],201)
+                state=request('/api/state')[1]
+                draft=state['movements'][0]
+                self.assertEqual(draft['confirmed'],0)
+                self.assertIsNone(draft['confirmed_at'])
+                self.assertEqual(state['products'][0]['stock'],11)
+                app.initialize()
+                self.assertEqual(request('/api/state')[1]['movements'][0]['confirmed'],0)
+                confirmation='/api/movements/'+str(draft['id'])+'/confirm'
+                self.assertEqual(request(confirmation,dict(confirmed_at='2026-02-30T10:00'))[0],400)
+                self.assertEqual(request('/api/state')[1]['products'][0]['stock'],11)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results=list(pool.map(lambda _: request(confirmation,dict(confirmed_at='2026-10-22T10:00'))[0],range(2)))
+                self.assertEqual(results,[201,201])
+                state=request('/api/state')[1]
+                self.assertEqual(state['products'][0]['stock'],18)
+                self.assertEqual(state['movements'][0]['confirmed'],1)
+                self.assertEqual(state['movements'][0]['confirmed_at'],'2026-10-22 10:00:00')
+                self.assertEqual(state['movements'][0]['created_at'],'2026-10-20 09:00:00')
+                self.assertEqual(request(sale_edit.replace('/edit','/confirm'),{})[0],400)
+                purchase['confirmed']='false'
+                self.assertEqual(request('/api/movements',purchase)[0],400)
                 with urllib.request.urlopen(base+'/') as r:
                     self.assertIn('仓序',r.read().decode())
             finally:
