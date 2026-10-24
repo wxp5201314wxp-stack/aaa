@@ -1,4 +1,5 @@
-import json, os, sqlite3
+import json, os, sqlite3, re
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -27,6 +28,25 @@ def initialize():
           amount INTEGER NOT NULL, partner TEXT NOT NULL, note TEXT NOT NULL,
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','+8 hours')));
         ''')
+        columns = {r['name'] for r in c.execute('PRAGMA table_info(movements)')}
+        if 'unit_price' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN unit_price INTEGER')
+            c.execute('UPDATE movements SET unit_price=amount/quantity')
+        if 'price_pending' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN price_pending INTEGER NOT NULL DEFAULT 0')
+        if 'updated_at' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN updated_at TEXT')
+
+def business_time(value):
+    if value is None:
+        return datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+    value = str(value).replace('T', ' ')
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?', value):
+        raise ValueError('业务时间格式不正确')
+    try:
+        return datetime.fromisoformat(value).strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        raise ValueError('业务时间无效')
 
 def integer(value, label, minimum=0):
     if isinstance(value, bool) or not str(value).isdigit() or int(value) < minimum:
@@ -71,7 +91,8 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
-        if self.path not in ('/api/products', '/api/movements'):
+        edit_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/edit', self.path)
+        if self.path not in ('/api/products', '/api/movements') and not edit_match:
             return self.reply({'error': '接口不存在'}, 404)
         try:
             length = int(self.headers.get('Content-Length', '0'))
@@ -92,20 +113,38 @@ class Handler(SimpleHTTPRequestHandler):
                     kind = d.get('kind')
                     if kind not in ('in','out'):
                         raise ValueError('业务类型无效')
-                    amount = money(d.get('unit_price')) * qty
+                    raw_price = d.get('unit_price')
+                    pending = kind == 'out' and (raw_price is None or str(raw_price).strip() == '')
+                    unit_price = None if pending else money(raw_price)
+                    amount = 0 if pending else unit_price * qty
+                    created_at = business_time(d.get('created_at'))
                     partner = required(d,'partner','往来单位')
                     note = str(d.get('note','')).strip()
                     if len(note) > 500:
                         raise ValueError('备注不能超过500字')
                     c.execute('BEGIN IMMEDIATE')
+                    old = None
+                    if edit_match:
+                        old = c.execute('SELECT * FROM movements WHERE id=?', (int(edit_match[1]),)).fetchone()
+                        if not old or old['kind'] != 'out':
+                            raise ValueError('只能编辑已存在的销售出库单')
+                        if kind != 'out' or pid != old['product_id']:
+                            raise ValueError('编辑销售单不能更换商品或业务类型')
                     p = c.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone()
                     if not p:
                         raise ValueError('商品不存在')
-                    if kind == 'out' and p['stock'] < qty:
-                        raise ValueError('库存不足，当前可用库存：' + str(p['stock']))
-                    c.execute('UPDATE products SET stock=stock+? WHERE id=?',(qty if kind=='in' else -qty,pid))
-                    c.execute('INSERT INTO movements(product_id,kind,quantity,amount,partner,note) VALUES(?,?,?,?,?,?)',
-                              (pid,kind,qty,amount,partner,note))
+                    delta = (old['quantity'] - qty) if old else (qty if kind == 'in' else -qty)
+                    if p['stock'] + delta < 0:
+                        raise ValueError('库存不足，无法保存该数量')
+                    c.execute('UPDATE products SET stock=stock+? WHERE id=?',(delta,pid))
+                    if old:
+                        c.execute('''UPDATE movements SET quantity=?,amount=?,unit_price=?,price_pending=?,
+                            partner=?,note=?,created_at=?,updated_at=? WHERE id=?''',
+                            (qty,amount,unit_price,int(pending),partner,note,created_at,business_time(None),old['id']))
+                    else:
+                        c.execute('''INSERT INTO movements(product_id,kind,quantity,amount,partner,note,
+                            created_at,unit_price,price_pending) VALUES(?,?,?,?,?,?,?,?,?)''',
+                            (pid,kind,qty,amount,partner,note,created_at,unit_price,int(pending)))
             return self.reply({'ok':True},201)
         except sqlite3.IntegrityError:
             return self.reply({'error':'商品编码已存在或数据不符合要求'},400)
