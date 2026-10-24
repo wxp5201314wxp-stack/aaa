@@ -58,6 +58,6 @@ document.querySelector('#scan-close').onclick=closeBarcodeScanner;
 scannerDialog.addEventListener('cancel',e=>{e.preventDefault();closeBarcodeScanner()});
 document.querySelector('#scan-search').onclick=()=>openBarcodeScanner(code=>{
   go('products');search=code;document.querySelector('#search').value=code;updateResults();
-  toast(state.products.some(p=>p.sku===code)?'已找到商品':'未找到该编码，可在新增商品中扫码建档');
+  toast(state.products.some(p=>!p.archived&&p.sku===code)?'已找到商品':'未找到该编码，可在新增商品中扫码建档');
 });
 window.addEventListener('pagehide',()=>{if(barcodeReader?.isScanning)stopBarcodeCamera().catch(()=>{})});

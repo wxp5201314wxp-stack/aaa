@@ -156,6 +156,51 @@ class InventoryTest(unittest.TestCase):
                 self.assertEqual(request(sale_edit.replace('/edit','/confirm'),{})[0],400)
                 purchase['confirmed']='false'
                 self.assertEqual(request('/api/movements',purchase)[0],400)
+                product_edit='/api/products/'+str(pid)+'/edit'
+                product_delete='/api/products/'+str(pid)+'/delete'
+                product_restore='/api/products/'+str(pid)+'/restore'
+                updated=dict(product,sku='RENAMED-001',name='修改后的商品',cost='15.50',price='25.60',minimum=2,stock=999)
+                self.assertEqual(request(product_edit,updated)[0],201)
+                state=request('/api/state')[1]
+                self.assertEqual(state['products'][0]['stock'],18)
+                self.assertEqual(state['products'][0]['name'],'修改后的商品')
+                self.assertEqual(state['products'][0]['cost'],1550)
+                self.assertEqual(state['movements'][0]['sku'],'RENAMED-001')
+                self.assertEqual(state['movements'][0]['amount'],7000)
+                self.assertEqual(request(product_delete,{})[0],400)
+                self.assertEqual(request('/api/products',product)[0],201)
+                other=request('/api/state')[1]['products'][0]['id']
+                updated['sku']=product['sku']
+                self.assertEqual(request(product_edit,updated)[0],400)
+                updated['sku']='RENAMED-001'
+                self.assertEqual(request('/api/products/'+str(other)+'/delete',{})[0],201)
+                self.assertEqual(len(request('/api/state')[1]['products']),1)
+                self.assertEqual(request('/api/products/'+str(other)+'/delete',{})[0],404)
+                self.assertEqual(request(adjust,dict(stock=0,expected_stock=18,reason='清理库存'))[0],201)
+                self.assertEqual(request(product_delete,{})[0],201)
+                state=request('/api/state')[1]
+                self.assertEqual(state['products'][0]['archived'],1)
+                count=len(state['movements'])
+                self.assertEqual(request('/api/movements',dict(purchase,confirmed=False))[0],400)
+                self.assertEqual(request(adjust,dict(stock=2,expected_stock=0,reason='不允许'))[0],400)
+                self.assertEqual(request(product_edit,updated)[0],400)
+                self.assertEqual(len(request('/api/state')[1]['movements']),count)
+                self.assertEqual(request('/api/products',updated)[0],400)
+                self.assertEqual(request(product_restore,{})[0],201)
+                app.initialize()
+                state=request('/api/state')[1]
+                self.assertEqual(state['products'][0]['archived'],0)
+                self.assertEqual(state['products'][0]['stock'],0)
+                self.assertEqual(len(state['movements']),count)
+                self.assertEqual(request('/api/movements',dict(purchase,confirmed=False))[0],201)
+                new_draft=request('/api/state')[1]['movements'][0]
+                confirm_archived='/api/movements/'+str(new_draft['id'])+'/confirm'
+                self.assertEqual(request(product_delete,{})[0],201)
+                self.assertEqual(request(confirm_archived,{})[0],400)
+                self.assertEqual(request('/api/state')[1]['products'][0]['stock'],0)
+                self.assertEqual(request(product_restore,{})[0],201)
+                self.assertEqual(request(confirm_archived,{})[0],201)
+                self.assertEqual(request('/api/state')[1]['products'][0]['stock'],7)
                 with urllib.request.urlopen(base+'/') as r:
                     self.assertIn('仓序',r.read().decode())
             finally:
