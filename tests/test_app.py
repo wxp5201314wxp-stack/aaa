@@ -24,6 +24,7 @@ class InventoryTest(unittest.TestCase):
                     self.assertEqual(row['unit_price'], 2000)
                     self.assertEqual(row['amount'], 6000)
                     self.assertEqual(row['price_pending'], 0)
+                    self.assertEqual(row['freight'], 0)
                     self.assertEqual(row['created_at'], '2026-10-20 08:00:00')
         finally:
             app.DB = old
@@ -95,6 +96,36 @@ class InventoryTest(unittest.TestCase):
                 app.initialize()
                 self.assertEqual(request('/api/state')[1]['products'][0]['stock'],3)
                 self.assertEqual(len(request('/api/state')[1]['movements']),3)
+                adjust='/api/products/'+str(pid)+'/stock'
+                self.assertEqual(request(adjust,dict(stock=12,expected_stock=3,reason='盘点修正'))[0],201)
+                self.assertEqual(request(adjust,dict(stock=20,expected_stock=3,reason='过期页面'))[0],409)
+                self.assertEqual(request(adjust,dict(stock=-1,expected_stock=12,reason='无效'))[0],400)
+                self.assertEqual(request(adjust,dict(stock=10,expected_stock=12,reason=''))[0],400)
+                state=request('/api/state')[1]
+                self.assertEqual(state['products'][0]['stock'],12)
+                self.assertEqual(len(state['adjustments']),1)
+                self.assertEqual(state['adjustments'][0]['before_stock'],3)
+                self.assertEqual(state['adjustments'][0]['after_stock'],12)
+                self.assertEqual(len(state['movements']),3)
+                m.update(quantity=1,unit_price='',freight='8.25',created_at='2026-10-20T10:00')
+                self.assertEqual(request('/api/movements',m)[0],201)
+                sale=request('/api/state')[1]['movements'][0]
+                self.assertEqual(sale['freight'],825)
+                self.assertEqual(sale['price_pending'],1)
+                sale_edit='/api/movements/'+str(sale['id'])+'/edit'
+                m.update(unit_price='20',freight='9.50')
+                self.assertEqual(request(sale_edit,m)[0],201)
+                self.assertEqual(request('/api/state')[1]['movements'][0]['freight'],950)
+                self.assertEqual(request('/api/state')[1]['products'][0]['stock'],11)
+                m['freight']='-1'
+                self.assertEqual(request(sale_edit,m)[0],400)
+                self.assertEqual(request('/api/state')[1]['movements'][0]['freight'],950)
+                m.pop('freight')
+                self.assertEqual(request(sale_edit,m)[0],201)
+                self.assertEqual(request('/api/state')[1]['movements'][0]['freight'],950)
+                app.initialize()
+                self.assertEqual(request('/api/state')[1]['products'][0]['stock'],11)
+                self.assertEqual(len(request('/api/state')[1]['adjustments']),1)
                 with urllib.request.urlopen(base+'/') as r:
                     self.assertIn('仓序',r.read().decode())
             finally:

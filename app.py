@@ -28,7 +28,13 @@ def initialize():
           amount INTEGER NOT NULL, partner TEXT NOT NULL, note TEXT NOT NULL,
           created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S','now','+8 hours')));
         ''')
+        c.execute('''CREATE TABLE IF NOT EXISTS stock_adjustments (
+            id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id),
+            before_stock INTEGER NOT NULL, after_stock INTEGER NOT NULL,
+            reason TEXT NOT NULL, created_at TEXT NOT NULL)''')
         columns = {r['name'] for r in c.execute('PRAGMA table_info(movements)')}
+        if 'freight' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN freight INTEGER NOT NULL DEFAULT 0')
         if 'unit_price' not in columns:
             c.execute('ALTER TABLE movements ADD COLUMN unit_price INTEGER')
             c.execute('UPDATE movements SET unit_price=amount/quantity')
@@ -87,12 +93,15 @@ class Handler(SimpleHTTPRequestHandler):
                 products = [dict(r) for r in c.execute('SELECT * FROM products ORDER BY id DESC')]
                 movements = [dict(r) for r in c.execute('''SELECT m.*, p.name, p.sku, p.unit FROM movements m
                     JOIN products p ON p.id=m.product_id ORDER BY m.id DESC''')]
-            return self.reply({'products': products, 'movements': movements})
+                adjustments = [dict(r) for r in c.execute('''SELECT a.*,p.name,p.sku,p.unit
+                    FROM stock_adjustments a JOIN products p ON p.id=a.product_id ORDER BY a.id DESC''')]
+            return self.reply({'products': products, 'movements': movements, 'adjustments': adjustments})
         return super().do_GET()
 
     def do_POST(self):
+        stock_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/stock', self.path)
         edit_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/edit', self.path)
-        if self.path not in ('/api/products', '/api/movements') and not edit_match:
+        if self.path not in ('/api/products', '/api/movements') and not edit_match and not stock_match:
             return self.reply({'error': '接口不存在'}, 404)
         try:
             length = int(self.headers.get('Content-Length', '0'))
@@ -102,7 +111,22 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(d, dict):
                 raise ValueError('请求格式不正确')
             with connect() as c:
-                if self.path == '/api/products':
+                if stock_match:
+                    target = integer(d.get('stock'), '调整后库存')
+                    expected = integer(d.get('expected_stock'), '原库存')
+                    reason = required(d,'reason','调整原因')
+                    c.execute('BEGIN IMMEDIATE')
+                    product = c.execute('SELECT * FROM products WHERE id=?',(int(stock_match[1]),)).fetchone()
+                    if not product:
+                        raise ValueError('商品不存在')
+                    if product['stock'] != expected:
+                        return self.reply({'error':'库存已被其他操作更新，请刷新后重试'},409)
+                    if target == expected:
+                        raise ValueError('调整后库存与原库存相同')
+                    c.execute('UPDATE products SET stock=? WHERE id=?',(target,product['id']))
+                    c.execute('''INSERT INTO stock_adjustments(product_id,before_stock,after_stock,reason,created_at)
+                        VALUES(?,?,?,?,?)''',(product['id'],expected,target,reason,business_time(None)))
+                elif self.path == '/api/products':
                     c.execute('INSERT INTO products(sku,name,category,unit,cost,price,minimum) VALUES(?,?,?,?,?,?,?)', (
                         required(d,'sku','商品编码'), required(d,'name','商品名称'),
                         required(d,'category','分类'), required(d,'unit','单位'), money(d.get('cost',0)),
@@ -117,6 +141,7 @@ class Handler(SimpleHTTPRequestHandler):
                     pending = kind == 'out' and (raw_price is None or str(raw_price).strip() == '')
                     unit_price = None if pending else money(raw_price)
                     amount = 0 if pending else unit_price * qty
+                    freight = money(d.get('freight',0)) if kind == 'out' else 0
                     created_at = business_time(d.get('created_at'))
                     partner = required(d,'partner','往来单位')
                     note = str(d.get('note','')).strip()
@@ -128,6 +153,8 @@ class Handler(SimpleHTTPRequestHandler):
                         old = c.execute('SELECT * FROM movements WHERE id=?', (int(edit_match[1]),)).fetchone()
                         if not old or old['kind'] != 'out':
                             raise ValueError('只能编辑已存在的销售出库单')
+                        if 'freight' not in d:
+                            freight = old['freight']
                         if kind != 'out' or pid != old['product_id']:
                             raise ValueError('编辑销售单不能更换商品或业务类型')
                     p = c.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone()
@@ -139,12 +166,12 @@ class Handler(SimpleHTTPRequestHandler):
                     c.execute('UPDATE products SET stock=stock+? WHERE id=?',(delta,pid))
                     if old:
                         c.execute('''UPDATE movements SET quantity=?,amount=?,unit_price=?,price_pending=?,
-                            partner=?,note=?,created_at=?,updated_at=? WHERE id=?''',
-                            (qty,amount,unit_price,int(pending),partner,note,created_at,business_time(None),old['id']))
+                            partner=?,note=?,created_at=?,updated_at=?,freight=? WHERE id=?''',
+                            (qty,amount,unit_price,int(pending),partner,note,created_at,business_time(None),freight,old['id']))
                     else:
                         c.execute('''INSERT INTO movements(product_id,kind,quantity,amount,partner,note,
-                            created_at,unit_price,price_pending) VALUES(?,?,?,?,?,?,?,?,?)''',
-                            (pid,kind,qty,amount,partner,note,created_at,unit_price,int(pending)))
+                            created_at,unit_price,price_pending,freight) VALUES(?,?,?,?,?,?,?,?,?,?)''',
+                            (pid,kind,qty,amount,partner,note,created_at,unit_price,int(pending),freight))
             return self.reply({'ok':True},201)
         except sqlite3.IntegrityError:
             return self.reply({'error':'商品编码已存在或数据不符合要求'},400)
