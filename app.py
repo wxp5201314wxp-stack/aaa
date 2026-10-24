@@ -45,6 +45,8 @@ def initialize():
             c.execute('UPDATE movements SET unit_price=amount/quantity')
         if 'price_pending' not in columns:
             c.execute('ALTER TABLE movements ADD COLUMN price_pending INTEGER NOT NULL DEFAULT 0')
+        if 'order_id' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN order_id INTEGER')
         if 'updated_at' not in columns:
             c.execute('ALTER TABLE movements ADD COLUMN updated_at TEXT')
 
@@ -78,6 +80,64 @@ def required(data, key, label):
     if not value or len(value) > 200:
         raise ValueError(label + '必填且不能超过200字')
     return value
+
+def save_outbound(c, d, edit_id=None):
+    items = d.get('items')
+    if d.get('kind') != 'out' or not isinstance(items, list) or not 1 <= len(items) <= 200:
+        raise ValueError('出库单须包含1至200项商品')
+    partner = required(d, 'partner', '客户')
+    created_at = business_time(d.get('created_at'))
+    note = str(d.get('note', '')).strip()
+    if len(note) > 500:
+        raise ValueError('备注不能超过500字')
+    freight = money(d.get('freight', 0))
+    parsed, seen = [], set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError('商品明细格式不正确')
+        pid = integer(item.get('product_id'), '商品', 1)
+        qty = integer(item.get('quantity'), '数量', 1)
+        if pid in seen:
+            raise ValueError('同一商品不能重复添加')
+        seen.add(pid)
+        raw = item.get('unit_price')
+        price = None if raw is None or str(raw).strip() == '' else money(raw)
+        parsed.append((pid, qty, price))
+    c.execute('BEGIN IMMEDIATE')
+    old_rows, order_id = [], None
+    if edit_id:
+        old = c.execute('SELECT * FROM movements WHERE id=?', (edit_id,)).fetchone()
+        if not old or old['kind'] != 'out':
+            raise ValueError('只能编辑已存在的销售出库单')
+        order_id = old['order_id'] or old['id']
+        old_rows = c.execute('SELECT * FROM movements WHERE order_id=? OR id=?', (order_id, order_id)).fetchall()
+        for row in old_rows:
+            c.execute('UPDATE products SET stock=stock+? WHERE id=?', (row['quantity'], row['product_id']))
+    for pid, qty, price in parsed:
+        product = c.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
+        if not product:
+            raise ValueError('商品不存在')
+        if product['stock'] < qty:
+            raise ValueError(product['name'] + '库存不足，无法保存该数量')
+        c.execute('UPDATE products SET stock=stock-? WHERE id=?', (qty, pid))
+    old_rows = sorted(old_rows, key=lambda row: row['id'])
+    retained = []
+    for index, (pid, qty, price) in enumerate(parsed):
+        values = (qty, 0 if price is None else qty * price, price, int(price is None), partner,
+                  note, created_at, business_time(None) if edit_id else None, freight if index == 0 else 0)
+        old = old_rows[index] if index < len(old_rows) else None
+        if old:
+            mid = old['id']
+            c.execute('UPDATE movements SET quantity=?,amount=?,unit_price=?,price_pending=?,partner=?,note=?,created_at=?,updated_at=?,freight=?,product_id=? WHERE id=?', values + (pid, mid,))
+        else:
+            cursor = c.execute("INSERT INTO movements(quantity,amount,unit_price,price_pending,partner,note,created_at,updated_at,freight,product_id,kind,confirmed) VALUES(?,?,?,?,?,?,?,?,?,?,'out',1)", values + (pid,))
+            mid = cursor.lastrowid
+        order_id = order_id or mid
+        retained.append(mid)
+        c.execute('UPDATE movements SET order_id=? WHERE id=?', (order_id, mid))
+    for row in old_rows:
+        if row['id'] not in retained:
+            c.execute('DELETE FROM movements WHERE id=?', (row['id'],))
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -148,6 +208,8 @@ class Handler(SimpleHTTPRequestHandler):
                         required(d,'sku','商品编码'), required(d,'name','商品名称'),
                         required(d,'category','分类'), required(d,'unit','单位'), money(d.get('cost',0)),
                         money(d.get('price',0)), integer(d.get('minimum',5),'预警库存')))
+                elif 'items' in d:
+                    save_outbound(c, d, int(edit_match[1]) if edit_match else None)
                 else:
                     pid = integer(d.get('product_id'), '商品', 1)
                     qty = integer(d.get('quantity'), '数量', 1)
@@ -173,6 +235,8 @@ class Handler(SimpleHTTPRequestHandler):
                         old = c.execute('SELECT * FROM movements WHERE id=?', (int(edit_match[1]),)).fetchone()
                         if not old or old['kind'] != 'out':
                             raise ValueError('只能编辑已存在的销售出库单')
+                        if old['order_id'] is not None:
+                            raise ValueError('请按整张出库单编辑商品明细')
                         if 'freight' not in d:
                             freight = old['freight']
                         if kind != 'out' or pid != old['product_id']:
