@@ -38,6 +38,10 @@ def initialize():
         if 'archived' not in product_columns:
             c.execute('ALTER TABLE products ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
         columns = {r['name'] for r in c.execute('PRAGMA table_info(movements)')}
+        if 'cancelled_at' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN cancelled_at TEXT')
+        if 'cancel_reason' not in columns:
+            c.execute("ALTER TABLE movements ADD COLUMN cancel_reason TEXT NOT NULL DEFAULT ''")
         if 'confirmed' not in columns:
             c.execute('ALTER TABLE movements ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1')
         if 'confirmed_at' not in columns:
@@ -175,10 +179,11 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         category_match = re.fullmatch(r'/api/categories/([1-9][0-9]*)/(edit|delete)', self.path)
         product_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/(edit|delete|restore)', self.path)
+        cancel_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/cancel', self.path)
         confirm_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/confirm', self.path)
         stock_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/stock', self.path)
         edit_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/edit', self.path)
-        if self.path not in ('/api/products', '/api/movements', '/api/categories') and not edit_match and not stock_match and not confirm_match and not product_match and not category_match:
+        if self.path not in ('/api/products', '/api/movements', '/api/categories') and not edit_match and not stock_match and not confirm_match and not product_match and not category_match and not cancel_match:
             return self.reply({'error': '接口不存在'}, 404)
         try:
             length = int(self.headers.get('Content-Length', '0'))
@@ -234,12 +239,29 @@ class Handler(SimpleHTTPRequestHandler):
                             c.execute('UPDATE products SET archived=1 WHERE id=?',(pid,))
                         else:
                             c.execute('DELETE FROM products WHERE id=?',(pid,))
+                elif cancel_match:
+                    reason = required(d, 'reason', '撤销原因')
+                    c.execute('BEGIN IMMEDIATE')
+                    movement = c.execute('SELECT * FROM movements WHERE id=?', (int(cancel_match[1]),)).fetchone()
+                    if not movement or movement['kind'] != 'in':
+                        raise ValueError('只能撤销采购入库单')
+                    if not movement['cancelled_at']:
+                        if movement['confirmed']:
+                            product = c.execute('SELECT * FROM products WHERE id=?', (movement['product_id'],)).fetchone()
+                            if product['stock'] < movement['quantity']:
+                                raise ValueError('当前库存不足以扣回入库数量，无法撤销')
+                            c.execute('UPDATE products SET stock=stock-? WHERE id=?', (movement['quantity'], movement['product_id']))
+                        now = business_time(None)
+                        c.execute('UPDATE movements SET cancelled_at=?,cancel_reason=?,updated_at=? WHERE id=?',
+                                  (now, reason, now, movement['id']))
                 elif confirm_match:
                     confirmed_at = business_time(d.get('confirmed_at'))
                     c.execute('BEGIN IMMEDIATE')
                     movement = c.execute('SELECT * FROM movements WHERE id=?',(int(confirm_match[1]),)).fetchone()
                     if not movement or movement['kind'] != 'in':
                         raise ValueError('只能确认采购入库单')
+                    if movement['cancelled_at']:
+                        raise ValueError('已撤销的入库单不能确认入库')
                     if not movement['confirmed']:
                         product = c.execute('SELECT * FROM products WHERE id=?',(movement['product_id'],)).fetchone()
                         if product['archived']:
