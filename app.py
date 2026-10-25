@@ -59,6 +59,24 @@ def initialize():
         if 'updated_at' not in columns:
             c.execute('ALTER TABLE movements ADD COLUMN updated_at TEXT')
 
+        # Existing databases did not retain receipt-time cost snapshots.
+        if 'inventory_value' not in product_columns:
+            c.execute('ALTER TABLE products ADD COLUMN inventory_value INTEGER')
+            c.execute('ALTER TABLE products ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0')
+            for product in c.execute('SELECT * FROM products').fetchall():
+                totals = c.execute("SELECT COALESCE(SUM(amount),0), COALESCE(SUM(quantity),0) FROM movements WHERE product_id=? AND kind='in' AND confirmed=1 AND cancelled_at IS NULL", (product['id'],)).fetchone()
+                unit = Decimal(totals[0]) / totals[1] if totals[1] else Decimal(product['cost'])
+                c.execute('UPDATE products SET inventory_value=?,cost_estimated=? WHERE id=?',
+                          (round_cents(unit * product['stock']), int(product['stock'] > 0), product['id']))
+        if 'cost_amount' not in columns:
+            c.execute('ALTER TABLE movements ADD COLUMN cost_amount INTEGER')
+            c.execute('ALTER TABLE movements ADD COLUMN cost_estimated INTEGER NOT NULL DEFAULT 0')
+            for product in c.execute('SELECT * FROM products').fetchall():
+                totals = c.execute("SELECT COALESCE(SUM(amount),0), COALESCE(SUM(quantity),0) FROM movements WHERE product_id=? AND kind='in' AND confirmed=1 AND cancelled_at IS NULL", (product['id'],)).fetchone()
+                unit = Decimal(totals[0]) / totals[1] if totals[1] else Decimal(product['cost'])
+                for row in c.execute("SELECT id,quantity FROM movements WHERE product_id=? AND kind='out'", (product['id'],)).fetchall():
+                    c.execute('UPDATE movements SET cost_amount=?,cost_estimated=1 WHERE id=?', (round_cents(unit * row['quantity']), row['id']))
+
 def business_time(value):
     if value is None:
         return datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
@@ -90,6 +108,59 @@ def required(data, key, label):
         raise ValueError(label + '必填且不能超过200字')
     return value
 
+def round_cents(value):
+    return int(Decimal(value).quantize(Decimal('1'), rounding='ROUND_HALF_UP'))
+
+def inventory_value(product):
+    return product['inventory_value'] if product['inventory_value'] is not None else product['stock'] * product['cost']
+
+def take_cost(value, quantity, stock):
+    return value if quantity == stock else round_cents(Decimal(value) * quantity / stock)
+
+def receive_stock(c, product, quantity, amount, estimated=False):
+    value = inventory_value(product)
+    inherited = bool(product['cost_estimated'] or product['inventory_value'] is None) if product['stock'] else False
+    c.execute('UPDATE products SET stock=stock+?,inventory_value=?,cost_estimated=? WHERE id=?',
+              (quantity, value + amount, int(inherited or estimated), product['id']))
+
+def outbound_costs(c, old_rows, parsed):
+    previous = {row['product_id']: row for row in old_rows}
+    requested = {pid: (qty, price) for pid, qty, price in parsed}
+    costs = {}
+    for pid in set(previous) | set(requested):
+        product = c.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
+        if not product:
+            raise ValueError('商品不存在')
+        old = previous.get(pid)
+        old_qty = old['quantity'] if old else 0
+        old_cost = old['cost_amount'] if old else 0
+        old_estimated = bool(old['cost_estimated']) if old else False
+        qty = requested[pid][0] if pid in requested else 0
+        if product['archived'] and qty and qty != old_qty:
+            raise ValueError('商品已归档，新增业务或调整数量前请先恢复商品')
+        delta = qty - old_qty
+        value = inventory_value(product)
+        estimated = bool(product['cost_estimated'] or product['inventory_value'] is None)
+        if delta > product['stock']:
+            raise ValueError(product['name'] + '库存不足，无法保存该数量')
+        if delta > 0:
+            extra = take_cost(value, delta, product['stock'])
+            cost = old_cost + extra
+            outgoing_estimated = old_estimated or estimated
+            value -= extra
+        elif delta < 0:
+            cost = take_cost(old_cost, qty, old_qty)
+            outgoing_estimated = old_estimated
+            value += old_cost - cost
+            estimated = estimated or old_estimated
+        else:
+            cost, outgoing_estimated = old_cost, old_estimated
+        remaining = product['stock'] - delta
+        c.execute('UPDATE products SET stock=?,inventory_value=?,cost_estimated=? WHERE id=?',
+                  (remaining, value, int(estimated and remaining > 0), pid))
+        costs[pid] = (cost, int(outgoing_estimated))
+    return costs
+
 def save_outbound(c, d, edit_id=None):
     items = d.get('items')
     if d.get('kind') != 'out' or not isinstance(items, list) or not 1 <= len(items) <= 200:
@@ -120,18 +191,7 @@ def save_outbound(c, d, edit_id=None):
             raise ValueError('只能编辑已存在的销售出库单')
         order_id = old['order_id'] or old['id']
         old_rows = c.execute('SELECT * FROM movements WHERE order_id=? OR id=?', (order_id, order_id)).fetchall()
-        for row in old_rows:
-            c.execute('UPDATE products SET stock=stock+? WHERE id=?', (row['quantity'], row['product_id']))
-    for pid, qty, price in parsed:
-        product = c.execute('SELECT * FROM products WHERE id=?', (pid,)).fetchone()
-        if not product:
-            raise ValueError('商品不存在')
-        previous = next((row for row in old_rows if row['product_id'] == pid), None)
-        if product['archived'] and (not previous or previous['quantity'] != qty):
-            raise ValueError('商品已归档，新增业务或调整数量前请先恢复商品')
-        if product['stock'] < qty:
-            raise ValueError(product['name'] + '库存不足，无法保存该数量')
-        c.execute('UPDATE products SET stock=stock-? WHERE id=?', (qty, pid))
+    costs = outbound_costs(c, old_rows, parsed)
     old_rows = sorted(old_rows, key=lambda row: row['id'])
     retained = []
     for index, (pid, qty, price) in enumerate(parsed):
@@ -146,7 +206,7 @@ def save_outbound(c, d, edit_id=None):
             mid = cursor.lastrowid
         order_id = order_id or mid
         retained.append(mid)
-        c.execute('UPDATE movements SET order_id=? WHERE id=?', (order_id, mid))
+        c.execute('UPDATE movements SET order_id=?,cost_amount=?,cost_estimated=? WHERE id=?', (order_id, *costs[pid], mid))
     for row in old_rows:
         if row['id'] not in retained:
             c.execute('DELETE FROM movements WHERE id=?', (row['id'],))
@@ -250,7 +310,11 @@ class Handler(SimpleHTTPRequestHandler):
                             product = c.execute('SELECT * FROM products WHERE id=?', (movement['product_id'],)).fetchone()
                             if product['stock'] < movement['quantity']:
                                 raise ValueError('当前库存不足以扣回入库数量，无法撤销')
-                            c.execute('UPDATE products SET stock=stock-? WHERE id=?', (movement['quantity'], movement['product_id']))
+                            value = inventory_value(product) - movement['amount']
+                            remaining = product['stock'] - movement['quantity']
+                            if value < 0 or (remaining == 0 and value != 0):
+                                raise ValueError('库存成本已发生变化，无法按原采购金额撤销，请先核对库存成本')
+                            c.execute('UPDATE products SET stock=?,inventory_value=?,cost_estimated=? WHERE id=?', (remaining, value, int(bool(product['cost_estimated']) and remaining > 0), product['id']))
                         now = business_time(None)
                         c.execute('UPDATE movements SET cancelled_at=?,cancel_reason=?,updated_at=? WHERE id=?',
                                   (now, reason, now, movement['id']))
@@ -266,8 +330,7 @@ class Handler(SimpleHTTPRequestHandler):
                         product = c.execute('SELECT * FROM products WHERE id=?',(movement['product_id'],)).fetchone()
                         if product['archived']:
                             raise ValueError('商品已归档，请先恢复商品再确认入库')
-                        c.execute('UPDATE products SET stock=stock+? WHERE id=?',
-                                  (movement['quantity'],movement['product_id']))
+                        receive_stock(c, product, movement['quantity'], movement['amount'])
                         c.execute('UPDATE movements SET confirmed=1,confirmed_at=?,updated_at=? WHERE id=?',
                                   (confirmed_at,business_time(None),movement['id']))
                 elif stock_match:
@@ -284,7 +347,13 @@ class Handler(SimpleHTTPRequestHandler):
                         return self.reply({'error':'库存已被其他操作更新，请刷新后重试'},409)
                     if target == expected:
                         raise ValueError('调整后库存与原库存相同')
-                    c.execute('UPDATE products SET stock=? WHERE id=?',(target,product['id']))
+                    value = inventory_value(product)
+                    if target > expected:
+                        extra = take_cost(value, target - expected, expected) if expected else product['cost'] * (target - expected)
+                        value += extra
+                    else:
+                        value -= take_cost(value, expected - target, expected)
+                    c.execute('UPDATE products SET stock=?,inventory_value=?,cost_estimated=? WHERE id=?',(target,value,int(target > 0 and (target > expected or product['cost_estimated'])),product['id']))
                     c.execute('''INSERT INTO stock_adjustments(product_id,before_stock,after_stock,reason,created_at)
                         VALUES(?,?,?,?,?)''',(product['id'],expected,target,reason,business_time(None)))
                 elif self.path == '/api/products':
@@ -293,6 +362,7 @@ class Handler(SimpleHTTPRequestHandler):
                         required(d,'sku','商品编码'), required(d,'name','商品名称'),
                         required(d,'category','分类'), required(d,'unit','单位'), money(d.get('cost',0)),
                         money(d.get('price',0)), integer(d.get('minimum',5),'预警库存')))
+                    c.execute('UPDATE products SET inventory_value=0 WHERE id=last_insert_rowid()')
                 elif 'items' in d:
                     save_outbound(c, d, int(edit_match[1]) if edit_match else None)
                 else:
@@ -336,7 +406,11 @@ class Handler(SimpleHTTPRequestHandler):
                         delta = 0
                     if p['stock'] + delta < 0:
                         raise ValueError('库存不足，无法保存该数量')
-                    c.execute('UPDATE products SET stock=stock+? WHERE id=?',(delta,pid))
+                    costs = None
+                    if kind == 'out':
+                        costs = outbound_costs(c, [old] if old else [], [(pid, qty, unit_price)])
+                    elif confirmed:
+                        receive_stock(c, p, qty, amount)
                     if old:
                         c.execute('''UPDATE movements SET quantity=?,amount=?,unit_price=?,price_pending=?,
                             partner=?,note=?,created_at=?,updated_at=?,freight=? WHERE id=?''',
@@ -346,6 +420,9 @@ class Handler(SimpleHTTPRequestHandler):
                             created_at,unit_price,price_pending,freight,confirmed,confirmed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
                             (pid,kind,qty,amount,partner,note,created_at,unit_price,int(pending),freight,int(confirmed),
                              created_at if kind == 'in' and confirmed else None))
+                    if costs is not None:
+                        mid = old['id'] if old else c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                        c.execute('UPDATE movements SET cost_amount=?,cost_estimated=? WHERE id=?', (*costs[pid], mid))
             return self.reply({'ok':True},201)
         except sqlite3.IntegrityError:
             return self.reply({'error':'商品编码已存在或数据不符合要求'},400)
