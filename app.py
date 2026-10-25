@@ -32,6 +32,8 @@ def initialize():
             id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id),
             before_stock INTEGER NOT NULL, after_stock INTEGER NOT NULL,
             reason TEXT NOT NULL, created_at TEXT NOT NULL)''')
+        c.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)')
+        c.execute('INSERT OR IGNORE INTO categories(name) SELECT DISTINCT category FROM products')
         product_columns = {r['name'] for r in c.execute('PRAGMA table_info(products)')}
         if 'archived' not in product_columns:
             c.execute('ALTER TABLE products ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
@@ -166,15 +168,17 @@ class Handler(SimpleHTTPRequestHandler):
                     JOIN products p ON p.id=m.product_id ORDER BY m.id DESC''')]
                 adjustments = [dict(r) for r in c.execute('''SELECT a.*,p.name,p.sku,p.unit
                     FROM stock_adjustments a JOIN products p ON p.id=a.product_id ORDER BY a.id DESC''')]
-            return self.reply({'products': products, 'movements': movements, 'adjustments': adjustments})
+                categories = [dict(r) for r in c.execute('SELECT * FROM categories ORDER BY name')]
+            return self.reply({'products': products, 'movements': movements, 'adjustments': adjustments, 'categories': categories})
         return super().do_GET()
 
     def do_POST(self):
+        category_match = re.fullmatch(r'/api/categories/([1-9][0-9]*)/(edit|delete)', self.path)
         product_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/(edit|delete|restore)', self.path)
         confirm_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/confirm', self.path)
         stock_match = re.fullmatch(r'/api/products/([1-9][0-9]*)/stock', self.path)
         edit_match = re.fullmatch(r'/api/movements/([1-9][0-9]*)/edit', self.path)
-        if self.path not in ('/api/products', '/api/movements') and not edit_match and not stock_match and not confirm_match and not product_match:
+        if self.path not in ('/api/products', '/api/movements', '/api/categories') and not edit_match and not stock_match and not confirm_match and not product_match and not category_match:
             return self.reply({'error': '接口不存在'}, 404)
         try:
             length = int(self.headers.get('Content-Length', '0'))
@@ -184,7 +188,28 @@ class Handler(SimpleHTTPRequestHandler):
             if not isinstance(d, dict):
                 raise ValueError('请求格式不正确')
             with connect() as c:
-                if product_match:
+                if self.path == '/api/categories' or category_match:
+                    c.execute('BEGIN IMMEDIATE')
+                    if not category_match:
+                        name = required(d, 'name', '类别名称')
+                        if c.execute('SELECT 1 FROM categories WHERE name=?', (name,)).fetchone():
+                            raise ValueError('类别名称已存在')
+                        c.execute('INSERT INTO categories(name) VALUES(?)', (name,))
+                    else:
+                        category = c.execute('SELECT * FROM categories WHERE id=?', (int(category_match[1]),)).fetchone()
+                        if not category:
+                            raise ValueError('类别不存在，请刷新后重试')
+                        if category_match[2] == 'edit':
+                            name = required(d, 'name', '类别名称')
+                            if c.execute('SELECT 1 FROM categories WHERE name=? AND id<>?', (name, category['id'])).fetchone():
+                                raise ValueError('类别名称已存在')
+                            c.execute('UPDATE categories SET name=? WHERE id=?', (name, category['id']))
+                            c.execute('UPDATE products SET category=? WHERE category=?', (name, category['name']))
+                        else:
+                            if c.execute('SELECT 1 FROM products WHERE category=?', (category['name'],)).fetchone():
+                                raise ValueError('该类别下还有商品（含已归档），请先修改商品类别再删除')
+                            c.execute('DELETE FROM categories WHERE id=?', (category['id'],))
+                elif product_match:
                     pid, action = int(product_match[1]), product_match[2]
                     c.execute('BEGIN IMMEDIATE')
                     product = c.execute('SELECT * FROM products WHERE id=?',(pid,)).fetchone()
@@ -193,6 +218,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if action == 'edit':
                         if product['archived']:
                             raise ValueError('请先恢复已归档商品，再编辑资料')
+                        c.execute('INSERT OR IGNORE INTO categories(name) VALUES(?)', (required(d,'category','分类'),))
                         c.execute('''UPDATE products SET sku=?,name=?,category=?,unit=?,cost=?,price=?,minimum=?
                             WHERE id=?''',(required(d,'sku','商品编码'),required(d,'name','商品名称'),
                             required(d,'category','分类'),required(d,'unit','单位'),money(d.get('cost')),
@@ -240,6 +266,7 @@ class Handler(SimpleHTTPRequestHandler):
                     c.execute('''INSERT INTO stock_adjustments(product_id,before_stock,after_stock,reason,created_at)
                         VALUES(?,?,?,?,?)''',(product['id'],expected,target,reason,business_time(None)))
                 elif self.path == '/api/products':
+                    c.execute('INSERT OR IGNORE INTO categories(name) VALUES(?)', (required(d,'category','分类'),))
                     c.execute('INSERT INTO products(sku,name,category,unit,cost,price,minimum) VALUES(?,?,?,?,?,?,?)', (
                         required(d,'sku','商品编码'), required(d,'name','商品名称'),
                         required(d,'category','分类'), required(d,'unit','单位'), money(d.get('cost',0)),
